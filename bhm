@@ -13,6 +13,7 @@
 #   bhm snapshot        Manage Btrfs snapshots (if enabled)
 #   bhm config          Show effective configuration
 #   bhm status          Quick overview of backup health
+#   bhm encrypt         Manage encryption (enable/disable/generate/status)
 #   bhm help            Show this help
 # =============================================================================
 
@@ -50,6 +51,8 @@ source "${BHM_LIB_DIR}/verify.sh"
 source "${BHM_LIB_DIR}/snapshot.sh"
 # shellcheck source=lib/cleanup.sh
 source "${BHM_LIB_DIR}/cleanup.sh"
+# shellcheck source=lib/encrypt.sh
+source "${BHM_LIB_DIR}/encrypt.sh"
 
 # --- Trap for fatal errors ----------------------------------------------
 trap '_log_catch_error ${LINENO}' ERR
@@ -218,6 +221,86 @@ _cmd_config() {
   _config_dump
 }
 
+# --- Subcommand: encrypt -------------------------------------------------
+
+_cmd_encrypt() {
+  _config_load
+  local action="${1:-status}"
+
+  case "$action" in
+    enable)
+      _config_write_user "ENCRYPT_ENABLE" "yes"
+      ok "Encryption enabled. Future backups will be encrypted."
+      info "To set a password file, run: bhm encrypt generate"
+      ;;
+    disable)
+      _config_write_user "ENCRYPT_ENABLE" "no"
+      ok "Encryption disabled. Future backups will NOT be encrypted."
+      echo "  Existing encrypted snapshots remain; decrypt with gpg manually."
+      ;;
+    generate)
+      local keyfile="${2:-${XDG_CONFIG_HOME:-$HOME/.config}/bhm/encrypt.key}"
+      _encrypt_check_gpg || return 1
+      _encrypt_generate_keyfile "$keyfile" || return 1
+      echo ""
+      info "To enable:  bhm encrypt enable"
+      if [[ "$keyfile" == "${XDG_CONFIG_HOME:-$HOME/.config}/bhm/encrypt.key" ]]; then
+        info "Key file auto-detected at default path."
+      else
+        _config_write_user "ENCRYPT_PASSWORD_FILE" "$keyfile"
+        info "Password file saved to config: ${keyfile}"
+      fi
+      ;;
+    passfile|password-file)
+      local keyfile="$2"
+      local resolved
+      resolved="$(realpath -m "$keyfile" 2>/dev/null || echo "$keyfile")"
+      if [[ ! -f "$resolved" ]]; then
+        log_error "File not found: ${resolved}"
+        return 1
+      fi
+      _config_write_user "ENCRYPT_PASSWORD_FILE" "$resolved"
+      ok "Password file set to: ${resolved}"
+      ;;
+    status)
+      echo ""
+      if [[ "${ENCRYPT_ENABLE:-no}" == "yes" ]]; then
+        ok "Encryption: ENABLED"
+      else
+        info "Encryption: disabled"
+      fi
+      echo "  Algorithm: ${ENCRYPT_ALGO:-AES256}"
+      if [[ -n "${ENCRYPT_PASSWORD_FILE:-}" ]]; then
+        echo "  Password file: ${ENCRYPT_PASSWORD_FILE}"
+        if [[ -f "${ENCRYPT_PASSWORD_FILE:-}" ]]; then
+          ok "  Password file: exists"
+        else
+          warn "  Password file: MISSING"
+        fi
+      else
+        echo "  Password source: BHM_ENCRYPT_PASSWORD or interactive prompt"
+      fi
+      echo ""
+      if [[ "${ENCRYPT_ENABLE:-no}" != "yes" ]]; then
+        echo "  To enable encryption:"
+        echo "    bhm encrypt generate           # create a key file"
+        echo "    bhm encrypt enable             # turn on encryption"
+        echo ""
+      fi
+      ;;
+    *)
+      echo "Usage: bhm encrypt {enable|disable|generate|password-file|status}"
+      echo ""
+      echo "  generate [path]      Generate a random encryption key file"
+      echo "  password-file PATH   Set path to existing password file"
+      echo "  enable               Enable encryption for future backups"
+      echo "  disable              Disable encryption"
+      echo "  status               Show encryption status"
+      return 1
+      ;;
+  esac
+}
+
 # --- Subcommand: status -------------------------------------------------
 
 _cmd_status() {
@@ -226,7 +309,7 @@ _cmd_status() {
   local host="${BACKUP_HOST:-localhost}"
   local user="${BACKUP_USER:-$USER}"
   local base="${BACKUP_DST}/${host}/${user}"
-  local last_snap latest_size total_snaps total_size
+  local last_snap latest_size total_snaps total_encrypted total_size
 
   info "Backup Home Manager — Status"
   echo ""
@@ -242,17 +325,30 @@ _cmd_status() {
   fi
 
   total_snaps="$(find "$base" -maxdepth 1 -type d -name '????-??-??_??-??-??' 2>/dev/null | wc -l)"
+  total_encrypted="$(find "$base" -maxdepth 1 -type f -name '????-??-??_??-??-??.tar.gpg' 2>/dev/null | wc -l)"
   total_size="$(du -sh "$base" 2>/dev/null | awk '{print $1}')"
   last_snap="$(_latest_backup_dir "$base")"
 
-  echo "  Snapshots:   ${total_snaps}"
+  # Fall back to latest encrypted snapshot
+  if [[ -z "$last_snap" ]] && (( total_encrypted > 0 )); then
+    last_snap="$(find "$base" -maxdepth 1 -type f -name '????-??-??_??-??-??.tar.gpg' 2>/dev/null | sort | tail -1)"
+  fi
+
+  echo "  Snapshots:   ${total_snaps} directory(s), ${total_encrypted} encrypted"
   echo "  Total size:  ${total_size:-unknown}"
 
   if [[ -n "$last_snap" ]]; then
-    latest_size="$(du -sh "$last_snap" 2>/dev/null | awk '{print $1}')"
+    if [[ -d "$last_snap" ]]; then
+      latest_size="$(du -sh "$last_snap" 2>/dev/null | awk '{print $1}')"
+    else
+      latest_size="$(du -h "$last_snap" 2>/dev/null | awk '{print $1}')"
+    fi
     local latest_date
     latest_date="$(stat -c '%y' "$last_snap" 2>/dev/null | cut -d. -f1)"
-    echo "  Latest:      $(basename "$last_snap") (${latest_size}, ${latest_date})"
+    local snap_label
+    snap_label="$(basename "$last_snap")"
+    snap_label="${snap_label%.tar.gpg}"
+    echo "  Latest:      ${snap_label} (${latest_size}, ${latest_date})"
   fi
 
   echo ""
@@ -263,15 +359,20 @@ _cmd_status() {
   fi
 
   # Last backup status
-  if [[ -n "$last_snap" ]] && [[ -f "${last_snap}/.bhm_metadata" ]]; then
-    local meta_rc
-    meta_rc="$(grep 'rsync_exit_code' "${last_snap}/.bhm_metadata" 2>/dev/null | cut -d= -f2)"
-    if _rsync_is_ok "$meta_rc"; then
-      ok "Last backup: OK (exit ${meta_rc})"
-    elif _rsync_is_partial "$meta_rc"; then
-      warn "Last backup: PARTIAL (exit ${meta_rc})"
-    else
-      fail "Last backup: FAILED (exit ${meta_rc})"
+  if [[ -n "$last_snap" ]]; then
+    if [[ "$last_snap" == *.tar.gpg ]]; then
+      echo "  Encryption:  enabled (latest snapshot is encrypted)"
+      info "  Run 'bhm verify' to check integrity."
+    elif [[ -f "${last_snap}/.bhm_metadata" ]]; then
+      local meta_rc
+      meta_rc="$(grep 'rsync_exit_code' "${last_snap}/.bhm_metadata" 2>/dev/null | cut -d= -f2)"
+      if _rsync_is_ok "$meta_rc"; then
+        ok "Last backup: OK (exit ${meta_rc})"
+      elif _rsync_is_partial "$meta_rc"; then
+        warn "Last backup: PARTIAL (exit ${meta_rc})"
+      else
+        fail "Last backup: FAILED (exit ${meta_rc})"
+      fi
     fi
   fi
 }
@@ -291,6 +392,7 @@ _cmd_help() {
   echo "  verify   Verify integrity of a snapshot"
   echo "  cleanup  Prune old backups per retention policy"
   echo "  snapshot Manage Btrfs snapshots (create|list|prune)"
+  echo "  encrypt  Manage backup encryption (enable|disable|generate|status)"
   echo "  config   Show effective configuration"
   echo "  status   Overview of backup health"
   echo "  help     Show this message"
@@ -335,6 +437,7 @@ _bhm_main() {
     cleanup|clean|prune) _cmd_cleanup "$@" ;;
     snapshot|snap)     _cmd_snapshot "$@" ;;
     config|conf)       _cmd_config "$@" ;;
+    encrypt|enc)       _cmd_encrypt "$@" ;;
     status|st)         _cmd_status "$@" ;;
     help|--help|-h)    _cmd_help ;;
     version|--version) _bhm_version ;;

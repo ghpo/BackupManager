@@ -50,6 +50,32 @@ _cleanup_exclude_file() {
   [[ -f "${BHM_EXCLUDE_FILE:-}" ]] && rm -f "$BHM_EXCLUDE_FILE"
 }
 
+# --- Encrypt snapshot after backup (if enabled) ---------------------------
+
+_encrypt_snapshot_step() {
+  [[ "${ENCRYPT_ENABLE:-no}" != "yes" ]] && return 0
+  local snapshot_dir="$1"
+
+  if [[ ! -d "$snapshot_dir" ]]; then
+    log_warn "Encryption skipped: snapshot dir not found: ${snapshot_dir}"
+    return 0
+  fi
+
+  local out_file="${snapshot_dir}.tar.gpg"
+  echo ""
+  info "Encrypting snapshot..."
+
+  if _encrypt_snapshot "$snapshot_dir" "$out_file"; then
+    _safe_remove "$snapshot_dir"
+    ok "Snapshot encrypted: $(basename "$out_file")"
+    log_info "Encrypted snapshot saved: ${out_file}"
+  else
+    warn "Encryption failed — unencrypted snapshot remains at: ${snapshot_dir}"
+    log_error "Snapshot encryption failed for: ${snapshot_dir}"
+  fi
+  return 0
+}
+
 # --- Determine latest backup for --link-dest ----------------------------
 
 _latest_backup_dir() {
@@ -158,12 +184,14 @@ _backup_run() {
     ok "Backup completed successfully in $(_format_seconds "$duration")"
     log_info "Backup saved to: ${backup_dir}"
     _backup_write_metadata "$backup_dir" "$rc" "$duration"
+    _encrypt_snapshot_step "$backup_dir"
     echo "$backup_dir"
     return 0
   elif _rsync_is_partial "$rc"; then
     warn "Backup partially completed (rsync exit ${rc}) in $(_format_seconds "$duration")"
     log_warn "rsync exit code ${rc} — partial transfer"
     _backup_write_metadata "$backup_dir" "$rc" "$duration"
+    _encrypt_snapshot_step "$backup_dir"
     echo "$backup_dir"
     return 2
   else
@@ -252,10 +280,20 @@ _backup_list_snapshots() {
   printf '%-22s %-12s %s\n' 'SNAPSHOT' 'SIZE' 'DATE'
   printf '%.0s-' {1..60}
   echo
+
+  # List unencrypted timestamp directories
   while IFS= read -r -d '' snap; do
     name="$(basename "$snap")"
     size="$(du -sh "$snap" 2>/dev/null | awk '{print $1}')"
     date="$(stat -c '%y' "$snap" 2>/dev/null | cut -d. -f1)"
     printf '%-22s %-12s %s\n' "$name" "$size" "$date"
   done < <(find "$base" -maxdepth 1 -type d -name '????-??-??_??-??-??' -print0 | sort -rz)
+
+  # List encrypted .tar.gpg snapshots
+  while IFS= read -r -d '' snap; do
+    name="$(basename "$snap" .tar.gpg)"
+    size="$(du -h "$snap" 2>/dev/null | awk '{print $1}')"
+    date="$(stat -c '%y' "$snap" 2>/dev/null | cut -d. -f1)"
+    printf '%-22s %-12s %s [encrypted]\n' "$name" "$size" "$date"
+  done < <(find "$base" -maxdepth 1 -type f -name '????-??-??_??-??-??.tar.gpg' -print0 | sort -rz)
 }

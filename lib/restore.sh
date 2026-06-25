@@ -6,32 +6,89 @@
 
 # shellcheck disable=SC2034,SC2153  # sourced
 
+# --- Resolve a snapshot path to a usable directory --------------------------
+# Handles both unencrypted (dir) and encrypted (.tar.gpg) snapshots.
+# For encrypted, decrypts to a temp dir that is cleaned up on shell exit.
+
+_restore_resolve_snapshot() {
+  local snap="$1"
+
+  if [[ -d "$snap" ]]; then
+    echo "$snap"
+    return 0
+  fi
+
+  if [[ -f "$snap" ]] && [[ "$snap" == *.tar.gpg ]]; then
+    local tmpdir
+    tmpdir="$(mktemp -d "/tmp/bhm_restore_XXXXXX")"
+    echo ""
+    info "Decrypting snapshot: $(basename "$snap")"
+
+    if _encrypt_decrypt_extract "$snap" "$tmpdir"; then
+      # Find the actual snapshot dir inside the extracted tar
+      local inner
+      inner="$(find "$tmpdir" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -1)"
+      if [[ -n "$inner" ]]; then
+        echo "$inner"
+      else
+        echo "$tmpdir"
+      fi
+      # Register cleanup
+      trap "rm -rf '${tmpdir}' 2>/dev/null || true" EXIT
+      return 0
+    else
+      rm -rf "$tmpdir" 2>/dev/null || true
+      return 1
+    fi
+  fi
+
+  log_error "Snapshot not found: ${snap}"
+  return 1
+}
+
 # --- List files in a backup snapshot ------------------------------------
 
 _restore_list_files() {
   local snapshot="$1"
   local pattern="${2:-}"
 
-  if [[ ! -d "$snapshot" ]]; then
-    log_error "Snapshot directory not found: ${snapshot}"
-    return 1
-  fi
-
-  if [[ -n "$pattern" ]]; then
-    find "$snapshot" -not -path '*/\.bhm_*' -path "*${pattern}*" 2>/dev/null \
-      | sed "s|^${snapshot}/||" \
-      | sort
+  if [[ -d "$snapshot" ]]; then
+    if [[ -n "$pattern" ]]; then
+      find "$snapshot" -not -path '*/\.bhm_*' -path "*${pattern}*" 2>/dev/null \
+        | sed "s|^${snapshot}/||" \
+        | sort
+    else
+      find "$snapshot" -not -path '*/\.bhm_*' -type f 2>/dev/null \
+        | sed "s|^${snapshot}/||" \
+        | sort
+    fi
+  elif [[ -f "$snapshot" ]] && [[ "$snapshot" == *.tar.gpg ]]; then
+    # List from encrypted tar
+    local snap_basename
+    snap_basename="$(basename "$snapshot" .tar.gpg)"
+    if [[ -n "$pattern" ]]; then
+      _encrypt_list_files "$snapshot" "*${pattern}*" 2>/dev/null \
+        | grep -v '/\.bhm_' \
+        | sed "s|^${snap_basename}/||" \
+        | sort
+    else
+      _encrypt_list_files "$snapshot" 2>/dev/null \
+        | grep -v '/\.bhm_' \
+        | grep -v '/$' \
+        | sed "s|^${snap_basename}/||" \
+        | sort
+    fi
   else
-    find "$snapshot" -not -path '*/\.bhm_*' -type f 2>/dev/null \
-      | sed "s|^${snapshot}/||" \
-      | sort
+    log_error "Snapshot not found: ${snapshot}"
+    return 1
   fi
 }
 
 # --- Show stats about a backup (dry-run for restore) --------------------
 
 _restore_dry_run() {
-  local snapshot="$1"
+  local snapshot
+  snapshot="$(_restore_resolve_snapshot "$1")" || return 1
   local target="${2:-$BACKUP_SRC}"
   local extra_args=()
 
@@ -46,7 +103,8 @@ _restore_dry_run() {
 # --- Execute restore ----------------------------------------------------
 
 _restore_run() {
-  local snapshot="$1"
+  local snapshot
+  snapshot="$(_restore_resolve_snapshot "$1")" || return 1
   local target="${2:-$BACKUP_SRC}"
   local partial_path="${3:-}"
 
@@ -140,18 +198,37 @@ _restore_cmd() {
       log_error "No snapshots found and --snapshot not provided"
       return 1
     fi
-    info "Auto-selected latest snapshot: $(basename "$snapshot")"
+    local snap_label
+    snap_label="$(basename "$snapshot")"
+    snap_label="${snap_label%.tar.gpg}"
+    info "Auto-selected latest snapshot: ${snap_label}"
   fi
 
   target="${target:-$BACKUP_SRC}"
 
+  # When listing files, pass raw snapshot path (resolver handles both)
+  if [[ -n "$partial" ]] && [[ "$dry_run" == "yes" ]]; then
+    # Preview specific files before restore
+    echo ""
+    _restore_list_files "$snapshot" "$partial"
+    echo ""
+  fi
+
   if [[ "$dry_run" == "yes" ]]; then
-    _restore_dry_run "$snapshot" "$target"
-    info "Pass --no-dry-run to execute the restore"
+    # Show overview listing if no specific path
+    if [[ -z "$partial" ]]; then
+      local count
+      count="$(_restore_list_files "$snapshot" | wc -l)"
+      info "Snapshot contains ${count} files"
+      info "Use --path PATTERN to preview matching files, or --no-dry-run to restore."
+    else
+      _restore_dry_run "$snapshot" "$target"
+      info "Pass --no-dry-run to execute the restore."
+    fi
     return 0
   fi
 
-  _confirm "Restore $(basename "$snapshot") to ${target}${partial:+/${partial}}? This may OVERWRITE existing files." || {
+  _confirm "Restore ${snap_label:-$(basename "$snapshot")} to ${target}${partial:+/${partial}}? This may OVERWRITE existing files." || {
     info "Restore cancelled."
     return 0
   }

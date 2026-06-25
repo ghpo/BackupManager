@@ -49,6 +49,11 @@ _config_set_defaults() {
   BTRFS_SNAPSHOT_PREFIX="bhm-"
   BTRFS_RETENTION="7"
 
+  # Encryption
+  ENCRYPT_ENABLE="no"
+  ENCRYPT_ALGO="AES256"
+  ENCRYPT_PASSWORD_FILE=""
+
   # Verify
   VERIFY_CHECKSUM="yes"
   VERIFY_SAMPLE_PCT="5"
@@ -96,7 +101,7 @@ _config_load() {
 # Print effective configuration (for --dry-run / --verbose)
 _config_dump() {
   local key
-  local skip_keys='^(_|BASH_SOURCE|EXCLUDE_PATTERNS|RSYNC_OPTS)'
+  local skip_keys='^(_|BASH_SOURCE|EXCLUDE_PATTERNS|RSYNC_OPTS|ENCRYPT_PASSWORD_FILE)'
   echo "# Loaded from: ${_bhm_conf_files_loaded[*]:-(defaults)}"
   echo ""
   # Simple key=value vars
@@ -104,7 +109,7 @@ _config_dump() {
     key="${key%%\[*}"
     [[ "$key" =~ $skip_keys ]] && continue
     declare -p "$key" 2>/dev/null | sed "s/^declare -[a-z]* //"
-  done < <(compgen -v | grep -E '^(BACKUP_|RETENTION_|BTRFS_|VERIFY_|LOG_|NOTIFY_)')
+  done < <(compgen -v | grep -E '^(BACKUP_|RETENTION_|BTRFS_|ENCRYPT_|VERIFY_|LOG_|NOTIFY_)')
   echo ""
   echo "RSYNC_OPTS=(${RSYNC_OPTS[*]})"
   echo "EXCLUDE_PATTERNS=(${EXCLUDE_PATTERNS[*]})"
