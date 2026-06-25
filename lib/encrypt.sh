@@ -19,6 +19,12 @@ _encrypt_passphrase() {
     cat "$ENCRYPT_PASSWORD_FILE"
     return 0
   fi
+  # Auto-detect default key file location
+  local default_key="${XDG_CONFIG_HOME:-$HOME/.config}/bhm/encrypt.key"
+  if [[ -f "$default_key" ]]; then
+    cat "$default_key"
+    return 0
+  fi
   if [[ -n "${BHM_ENCRYPT_PASSWORD:-}" ]]; then
     echo "$BHM_ENCRYPT_PASSWORD"
     return 0

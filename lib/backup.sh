@@ -123,13 +123,13 @@ _estimate_backup_size() {
 
   info "Calculating backup size (scanning source)..." >&2
   local out
-  out="$(rsync "${rsync_args[@]}" 2>&1)" || true
+  out="$(LC_ALL=C rsync "${rsync_args[@]}" 2>&1)" || true
   rm -rf "$dest_tmp"
 
-  # Parse total size from --stats output
+  # Parse total size from --stats output (LC_ALL=C avoids locale number formatting)
   local total_size total_files
-  total_size="$(echo "$out" | grep 'Total transferred file size' | grep -oP '[\d,]+' | tail -1 | tr -d ',')"
-  total_files="$(echo "$out" | grep 'Number of files' | grep -oP '[\d,]+' | tail -1 | tr -d ',')"
+  total_size="$(echo "$out" | grep 'Total transferred file size' | grep -oP '[\d]+' | tail -1)"
+  total_files="$(echo "$out" | grep 'Number of files' | grep -oP '[\d]+' | tail -1)"
 
   if [[ -z "$total_size" || "$total_size" == "0" ]]; then
     # Fallback: count files with du (slower but reliable)

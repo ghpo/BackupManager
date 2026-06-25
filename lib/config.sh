@@ -139,8 +139,17 @@ _config_write_user() {
   _ensure_dir "$conf_dir" || return 1
 
   if [[ -f "$conf_file" ]] && grep -q "^${key}=" "$conf_file" 2>/dev/null; then
-    # Update existing key
-    sed -i "s|^${key}=.*|${key}=\"${value}\"|" "$conf_file"
+    # Replace the line using Bash (avoid sed quoting issues with paths/special chars)
+    local tmp_file
+    tmp_file="$(mktemp)"
+    while IFS= read -r line; do
+      if [[ "$line" =~ ^${key}= ]]; then
+        echo "${key}=\"${value}\""
+      else
+        echo "$line"
+      fi
+    done < "$conf_file" > "$tmp_file" && mv "$tmp_file" "$conf_file"
+    rm -f "$tmp_file" 2>/dev/null || true
   else
     # Append to file (or create new)
     echo "${key}=\"${value}\"" >> "$conf_file"
@@ -161,13 +170,15 @@ _config_prompt_dest() {
   done
 
   if [[ ${#suggestions[@]} -gt 0 ]]; then
-    echo "  Detected mount points: ${suggestions[*]}"
+    echo "  Detected mount points: ${suggestions[*]}" >&2
   fi
 
   local user_dst
   read -r -p "${prompt_label} [${current}]: " user_dst
   user_dst="${user_dst:-$current}"
   user_dst="${user_dst/#\~/$HOME}"
+  # Trim trailing whitespace that read -r preserves
+  user_dst="${user_dst%"${user_dst##*[![:space:]]}"}"
 
   # Verify it exists or ask to create
   if [[ ! -d "$user_dst" ]]; then

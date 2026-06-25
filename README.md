@@ -105,8 +105,9 @@ bhm backup
 | Priority | Source | Description |
 |---|---|---|
 | 1 | `ENCRYPT_PASSWORD_FILE` | Path to a file containing the passphrase (e.g. `~/.config/bhm/encrypt.key`) |
-| 2 | `BHM_ENCRYPT_PASSWORD` | Environment variable with the passphrase |
-| 3 | Interactive prompt | Asked at runtime (only when stdin is a terminal) |
+| 2 | Auto-detect | `~/.config/bhm/encrypt.key` — created by `bhm encrypt generate` (no config needed) |
+| 3 | `BHM_ENCRYPT_PASSWORD` | Environment variable with the passphrase |
+| 4 | Interactive prompt | Asked at runtime (only when stdin is a terminal) |
 
 ### Security level
 
