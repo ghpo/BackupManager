@@ -117,6 +117,8 @@ _estimate_backup_size() {
   local latest_dir
   latest_dir="$(_latest_backup_dir "${BACKUP_DST}/${host}/${user}")"
   local rsync_args=("${RSYNC_OPTS[@]}")
+  # Remove --human-readable for parseable raw byte output
+  rsync_args=("${rsync_args[@]/--human-readable/}")
   rsync_args+=(--exclude-from="$excl_file" --dry-run)
   [[ -n "$latest_dir" && -d "$latest_dir" ]] && rsync_args+=(--link-dest="$latest_dir")
   rsync_args+=("$src/" "${dest_tmp}/")
@@ -126,10 +128,10 @@ _estimate_backup_size() {
   out="$(LC_ALL=C rsync "${rsync_args[@]}" 2>&1)" || true
   rm -rf "$dest_tmp"
 
-  # Parse total size from --stats output (LC_ALL=C avoids locale number formatting)
+  # Parse stats (rsync respects locale, so extract the right field with awk, strip non-digits)
   local total_size total_files
-  total_size="$(echo "$out" | grep 'Total transferred file size' | grep -oP '[\d]+' | tail -1)"
-  total_files="$(echo "$out" | grep 'Number of files' | grep -oP '[\d]+' | tail -1)"
+  total_size="$(echo "$out" | grep 'Total transferred file size' | awk '{print $5}' | tr -dc '0-9')"
+  total_files="$(echo "$out" | grep 'Number of files' | awk '{print $4}' | tr -dc '0-9')"
 
   if [[ -z "$total_size" || "$total_size" == "0" ]]; then
     # Fallback: count files with du (slower but reliable)
