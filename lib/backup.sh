@@ -116,9 +116,12 @@ _estimate_backup_size() {
   local user="${BACKUP_USER:-$USER}"
   local latest_dir
   latest_dir="$(_latest_backup_dir "${BACKUP_DST}/${host}/${user}")"
-  local rsync_args=("${RSYNC_OPTS[@]}")
-  # Remove --human-readable for parseable raw byte output
-  rsync_args=("${rsync_args[@]/--human-readable/}")
+  local rsync_args=()
+  local opt
+  for opt in "${RSYNC_OPTS[@]}"; do
+    [[ "$opt" == --human-readable ]] && continue
+    rsync_args+=("$opt")
+  done
   rsync_args+=(--exclude-from="$excl_file" --dry-run)
   [[ -n "$latest_dir" && -d "$latest_dir" ]] && rsync_args+=(--link-dest="$latest_dir")
   rsync_args+=("$src/" "${dest_tmp}/")
