@@ -1,0 +1,64 @@
+name: bhm CI
+
+on:
+  push:
+    branches: [main, master, develop]
+    paths-ignore: ['docs/**', '*.md']
+  pull_request:
+    branches: [main, master]
+  schedule:
+    - cron: '0 6 * * 1'  # every Monday 06:00
+
+jobs:
+  shellcheck:
+    name: ShellCheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ShellCheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: Run ShellCheck on all scripts
+        run: |
+          shellcheck --version
+          shellcheck --shell=bash \
+            --external-sources \
+            --severity=style \
+            bhm lib/*.sh tests/bats/*.bash tests/run_tests.sh
+
+  bats-tests:
+    name: Bats Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Bats
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bats
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get install -y rsync findutils coreutils
+
+      - name: Run Bats test suite
+        run: |
+          ./tests/run_tests.sh
+        env:
+          BHM_HOME: ${{ github.workspace }}
+
+  rsync-compat:
+    name: Rsync Compatibility
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Test rsync basic invocation
+        run: |
+          rsync --version
+          mkdir -p /tmp/bhm-ci-src /tmp/bhm-ci-dst
+          echo "test" > /tmp/bhm-ci-src/file.txt
+          rsync --archive --link-dest=/tmp/bhm-ci-dst/prev \
+            /tmp/bhm-ci-src/ /tmp/bhm-ci-dst/current/
+          echo "rsync --link-dest works correctly"

@@ -1,0 +1,349 @@
+#!/usr/bin/env bash
+# =============================================================================
+# bhm — Backup Home Manager
+# Professional incremental backup for Linux home directories
+# =============================================================================
+#
+# Usage:
+#   bhm backup          Run a full backup now
+#   bhm list            List available backup snapshots
+#   bhm restore         Restore from a snapshot (dry-run by default)
+#   bhm verify          Verify latest snapshot integrity
+#   bhm cleanup         Prune old backups per retention policy
+#   bhm snapshot        Manage Btrfs snapshots (if enabled)
+#   bhm config          Show effective configuration
+#   bhm status          Quick overview of backup health
+#   bhm help            Show this help
+# =============================================================================
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+# --- Resolve lib directory ------------------------------------------------
+# Development:   ./bhm → lib/*.sh  (BHM_HOME = project root)
+# Installed:     /usr/local/bin/bhm → /usr/local/lib/bhm/*.sh
+BHM_HOME="$(cd "$(dirname "$0")" && pwd)"
+BHM_LIB_DIR="${BHM_HOME}/lib"
+if [[ ! -d "$BHM_LIB_DIR" ]]; then
+  BHM_LIB_DIR="${BHM_HOME}/../lib/bhm"
+  if [[ ! -d "$BHM_LIB_DIR" ]]; then
+    BHM_LIB_DIR="/usr/local/lib/bhm"
+  fi
+fi
+export BHM_HOME BHM_LIB_DIR
+
+# --- Source all libs -----------------------------------------------------
+# shellcheck source=lib/logging.sh
+source "${BHM_LIB_DIR}/logging.sh"
+# shellcheck source=lib/utils.sh
+source "${BHM_LIB_DIR}/utils.sh"
+# shellcheck source=lib/config.sh
+source "${BHM_LIB_DIR}/config.sh"
+# shellcheck source=lib/backup.sh
+source "${BHM_LIB_DIR}/backup.sh"
+# shellcheck source=lib/restore.sh
+source "${BHM_LIB_DIR}/restore.sh"
+# shellcheck source=lib/verify.sh
+source "${BHM_LIB_DIR}/verify.sh"
+# shellcheck source=lib/snapshot.sh
+source "${BHM_LIB_DIR}/snapshot.sh"
+# shellcheck source=lib/cleanup.sh
+source "${BHM_LIB_DIR}/cleanup.sh"
+
+# --- Trap for fatal errors ----------------------------------------------
+trap '_log_catch_error ${LINENO}' ERR
+
+# --- Global CLI state ----------------------------------------------------
+VERBOSE="${VERBOSE:-0}"
+BHM_DRY_RUN="${BHM_DRY_RUN:-0}"
+
+# --- Subcommand: backup -------------------------------------------------
+
+_cmd_backup() {
+  local skip_verify=0 cli_dest=""
+  local OPTS
+  OPTS="$(getopt -o vn,d: --long verbose,dry-run,skip-verify,dest: -n 'bhm backup' -- "$@")" || return 1
+  eval set -- "$OPTS"
+
+  while true; do
+    case "$1" in
+      -v|--verbose)    VERBOSE=1; shift ;;
+      -n|--dry-run)    BHM_DRY_RUN=1; shift ;;
+      --skip-verify)   skip_verify=1; shift ;;
+      -d|--dest)       cli_dest="$2"; shift 2 ;;
+      --) shift; break ;;
+    esac
+  done
+
+  _log_init
+  _config_load
+
+  if [[ -n "$cli_dest" ]]; then
+    BACKUP_DST="$cli_dest"
+  fi
+
+  # First-run setup: prompt for destination if not configured
+  if [[ -z "$cli_dest" ]]; then
+    _config_first_run
+  fi
+
+  _config_validate || return 1
+
+  local overall_status=0
+  local start_time
+  start_time="$(date +%s)"
+
+  # Pre-backup Btrfs snapshot
+  _btrfs_snapshot_create || true
+
+  if (( BHM_DRY_RUN )); then
+    info "DRY RUN: Would backup ${BACKUP_SRC} → ${BACKUP_DST}"
+    info "DRY RUN: Exclusions: ${EXCLUDE_PATTERNS[*]}"
+    return 0
+  fi
+
+  # Show size estimate and progress info
+  echo ""
+  info "Source: ${BACKUP_SRC}"
+  info "Destination: ${BACKUP_DST}"
+  echo ""
+  local estimate
+  estimate="$(_estimate_backup_size "$BACKUP_SRC")"
+  local est_size="${estimate%%|*}"
+  local est_files="${estimate##*|}"
+  if [[ "$est_size" != "0" ]] && [[ -n "$est_size" ]]; then
+    info "Estimated: $(_format_bytes "$est_size") across ${est_files} files (excluding patterns)"
+  else
+    info "Estimated: ${est_files} files to scan"
+  fi
+  echo ""
+  if ! _confirm "Proceed with backup?" y; then
+    info "Backup cancelled."
+    return 1
+  fi
+  echo ""
+
+  # Run backup
+  _backup_run "$BACKUP_SRC" || {
+    overall_status=$?
+  }
+
+  local end_time
+  end_time="$(date +%s)"
+  local duration=$(( end_time - start_time ))
+
+  # Verify after backup (unless skipped)
+  if (( overall_status < 2 )) && [[ "$skip_verify" == "0" ]]; then
+    _verify_latest || true
+  fi
+
+  # Post-backup snapshot pruning
+  _btrfs_snapshot_prune || true
+
+  # Cleanup old backups
+  _cleanup_run || true
+
+  # Final report
+  if (( overall_status == 0 )); then
+    _log_summary "$duration" "SUCCESS" ""
+    ok "Backup complete. Duration: $(_format_seconds "$duration")"
+  elif (( overall_status == 2 )); then
+    _log_summary "$duration" "PARTIAL" "rsync reported partial transfer"
+    warn "Backup partially completed (rsync exit 23/24/25). See logs."
+  else
+    _log_summary "$duration" "FAILED" "rsync reported fatal error"
+    fail "Backup FAILED. Check logs: ${LOG_DIR}"
+  fi
+
+  return "$overall_status"
+}
+
+# --- Subcommand: list ---------------------------------------------------
+
+_cmd_list() {
+  _config_load
+  _backup_list_snapshots
+}
+
+# --- Subcommand: restore ------------------------------------------------
+
+_cmd_restore() {
+  _config_load
+  _config_validate || return 1
+  _restore_cmd "$@"
+}
+
+# --- Subcommand: verify -------------------------------------------------
+
+_cmd_verify() {
+  _config_load
+  _verify_cmd "$@"
+}
+
+# --- Subcommand: cleanup ------------------------------------------------
+
+_cmd_cleanup() {
+  _log_init
+  _config_load
+  _cleanup_run
+}
+
+# --- Subcommand: snapshot -----------------------------------------------
+
+_cmd_snapshot() {
+  _config_load
+
+  if ! _btrfs_check_config; then
+    fail "Btrfs snapshots are not available/enabled."
+    info "Set BTRFS_ENABLE=yes and BTRFS_SUBVOL in bhm.conf"
+    return 1
+  fi
+
+  local action="${1:-list}"
+  shift 2>/dev/null || true
+
+  case "$action" in
+    create)   _btrfs_snapshot_create ;;
+    list)     _btrfs_snapshot_list ;;
+    prune)    _btrfs_snapshot_prune ;;
+    *)        echo "Usage: bhm snapshot {create|list|prune}"; return 1 ;;
+  esac
+}
+
+# --- Subcommand: config -------------------------------------------------
+
+_cmd_config() {
+  _config_load
+  _config_dump
+}
+
+# --- Subcommand: status -------------------------------------------------
+
+_cmd_status() {
+  _config_load
+
+  local host="${BACKUP_HOST:-localhost}"
+  local user="${BACKUP_USER:-$USER}"
+  local base="${BACKUP_DST}/${host}/${user}"
+  local last_snap latest_size total_snaps total_size
+
+  info "Backup Home Manager — Status"
+  echo ""
+  echo "  Source:      ${BACKUP_SRC}"
+  echo "  Destination: ${BACKUP_DST}"
+  echo "  Host/User:   ${host}/${user}"
+  echo ""
+
+  if [[ ! -d "$base" ]]; then
+    warn "No backup directory yet."
+    echo "  Run 'bhm backup' to create the first backup."
+    return 0
+  fi
+
+  total_snaps="$(find "$base" -maxdepth 1 -type d -name '????-??-??_??-??-??' 2>/dev/null | wc -l)"
+  total_size="$(du -sh "$base" 2>/dev/null | awk '{print $1}')"
+  last_snap="$(_latest_backup_dir "$base")"
+
+  echo "  Snapshots:   ${total_snaps}"
+  echo "  Total size:  ${total_size:-unknown}"
+
+  if [[ -n "$last_snap" ]]; then
+    latest_size="$(du -sh "$last_snap" 2>/dev/null | awk '{print $1}')"
+    local latest_date
+    latest_date="$(stat -c '%y' "$last_snap" 2>/dev/null | cut -d. -f1)"
+    echo "  Latest:      $(basename "$last_snap") (${latest_size}, ${latest_date})"
+  fi
+
+  echo ""
+  if _btrfs_check_config 2>/dev/null; then
+    ok "Btrfs snapshots: enabled (subvol: ${BTRFS_SUBVOL})"
+  else
+    info "Btrfs snapshots: not configured"
+  fi
+
+  # Last backup status
+  if [[ -n "$last_snap" ]] && [[ -f "${last_snap}/.bhm_metadata" ]]; then
+    local meta_rc
+    meta_rc="$(grep 'rsync_exit_code' "${last_snap}/.bhm_metadata" 2>/dev/null | cut -d= -f2)"
+    if _rsync_is_ok "$meta_rc"; then
+      ok "Last backup: OK (exit ${meta_rc})"
+    elif _rsync_is_partial "$meta_rc"; then
+      warn "Last backup: PARTIAL (exit ${meta_rc})"
+    else
+      fail "Last backup: FAILED (exit ${meta_rc})"
+    fi
+  fi
+}
+
+# --- Subcommand: help ---------------------------------------------------
+
+_cmd_help() {
+  _bhm_version
+  echo ""
+  # Extract usage from header
+  sed -n '/^# Usage:/,/^# ===/p' "$0" | sed 's/^# //g; s/^#$//g'
+  echo ""
+  echo "Commands:"
+  echo "  backup   Run an incremental backup now"
+  echo "  list     List available backup snapshots"
+  echo "  restore  Restore files from a snapshot"
+  echo "  verify   Verify integrity of a snapshot"
+  echo "  cleanup  Prune old backups per retention policy"
+  echo "  snapshot Manage Btrfs snapshots (create|list|prune)"
+  echo "  config   Show effective configuration"
+  echo "  status   Overview of backup health"
+  echo "  help     Show this message"
+  echo ""
+  echo "Options (global):"
+  echo "  --verbose, -v    Increase log verbosity"
+  echo "  --dry-run, -n    Show what would be done"
+  echo ""
+  echo "Backup options:"
+  echo "  --dest, -d PATH  Backup destination (overrides config)"
+  echo "  --skip-verify    Skip post-backup integrity check"
+  echo ""
+  echo "Examples:"
+  echo "  bhm backup                # Run backup with defaults"
+  echo "  bhm backup -d /mnt/backup # Backup to external device"
+  echo "  bhm backup --skip-verify  # Skip post-backup verification"
+  echo "  bhm list                  # List all snapshots"
+  echo "  bhm restore               # Dry-run restore from latest"
+  echo "  bhm restore --no-dry-run  # Actually restore latest"
+  echo "  bhm restore --path Documents/project --no-dry-run  # Partial restore"
+  echo "  bhm verify                # Verify latest snapshot"
+  echo "  bhm cleanup               # Apply retention policy"
+}
+
+# --- Main dispatch ------------------------------------------------------
+
+_bhm_main() {
+  # No args
+  if (( $# == 0 )); then
+    _cmd_help
+    exit 0
+  fi
+
+  local cmd="${1:-help}"
+  shift
+
+  case "$cmd" in
+    backup)            _cmd_backup "$@" ;;
+    list|ls)           _cmd_list "$@" ;;
+    restore)           _cmd_restore "$@" ;;
+    verify|check)      _cmd_verify "$@" ;;
+    cleanup|clean|prune) _cmd_cleanup "$@" ;;
+    snapshot|snap)     _cmd_snapshot "$@" ;;
+    config|conf)       _cmd_config "$@" ;;
+    status|st)         _cmd_status "$@" ;;
+    help|--help|-h)    _cmd_help ;;
+    version|--version) _bhm_version ;;
+    *)
+      echo "Unknown command: ${cmd}"
+      echo "Run 'bhm help' for usage."
+      exit 1
+      ;;
+  esac
+}
+
+_bhm_main "$@"

@@ -1,0 +1,25 @@
+# Claude Code session data (personal paths, history)
+.claude/
+
+# Test artifacts
+tests/reports/
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Secret / env files
+.env
+.env.*
+
+# Build artifacts
+*.tar.gz
+*.deb
+*.rpm
