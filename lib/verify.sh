@@ -53,35 +53,43 @@ _verify_snapshot() {
 
     # Decrypt to stdout, pipe to tar t — no files written to disk.
     # Single pass: capture the full listing to count entries.
+    # Uses a temp file because PIPESTATUS is not accessible from $(...) subshells.
     info "Verifying decryption and archive structure..."
     local pw
     pw="$(_encrypt_passphrase)" || return 1
 
-    local entries
-    entries="$(gpg --decrypt \
+    local entries_file
+    entries_file="$(mktemp)" || return 1
+
+    # Run pipe in current shell, capture listing to temp file.
+    # The || true prevents pipefail+errexit from killing the script.
+    gpg --decrypt \
         --batch \
         --no-symkey-cache \
         --pinentry-mode loopback \
         --passphrase-fd 3 \
         3< <(echo "$pw") \
-        "$snapshot" 2>/dev/null | tar t 2>/dev/null)"
+        "$snapshot" 2>/dev/null | tar t > "$entries_file" 2>/dev/null || true
     local gpg_rc="${PIPESTATUS[0]}" tar_rc="${PIPESTATUS[1]}"
 
     if (( gpg_rc != 0 )); then
+      rm -f "$entries_file" 2>/dev/null || true
       fail "Decryption failed (gpg exit ${gpg_rc})"
       return 1
     fi
 
     if (( tar_rc != 0 )); then
+      rm -f "$entries_file" 2>/dev/null || true
       fail "Archive structure is corrupt (tar exit ${tar_rc})"
       return 1
     fi
 
     # Count entries from the captured listing (single pass)
     local total_entries total_dirs total_files
-    total_entries="$(echo "$entries" | wc -l)"
-    total_dirs="$(echo "$entries" | grep '/$' | wc -l)"
+    total_entries="$(wc -l < "$entries_file")"
+    total_dirs="$(grep -c '/$' "$entries_file" 2>/dev/null || echo 0)"
     total_files=$(( total_entries - total_dirs ))
+    rm -f "$entries_file" 2>/dev/null || true
 
     ok "Structure: ${total_dirs} directories, ${total_files} files"
     ok "Encrypted snapshot integrity verified (no data written to disk)"
