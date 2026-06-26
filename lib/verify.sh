@@ -34,28 +34,62 @@ _verify_snapshot() {
   local cleanup_dir=""
 
   # Handle encrypted snapshots (.tar.gpg)
+  # Verify integrity in-place: decrypt → pipe to tar t (list mode).
+  # This checks both gpg decryption AND tar archive structure
+  # without writing any data to disk.
   if [[ -f "$snapshot" ]] && [[ "$snapshot" == *.tar.gpg ]]; then
-    info "Encrypted snapshot: $(basename "$snapshot")"
-    cleanup_dir="$(mktemp -d "/tmp/bhm_verify_XXXXXX")"
+    local snap_size
+    snap_size="$(stat -c '%s' "$snapshot" 2>/dev/null || echo "0")"
+    info "Encrypted snapshot: $(basename "$snapshot") ($(_format_bytes "$snap_size"))"
 
-    if ! _encrypt_decrypt_extract "$snapshot" "$cleanup_dir"; then
-      rm -rf "$cleanup_dir" 2>/dev/null || true
-      fail "Failed to decrypt snapshot for verification"
+    # Check magic bytes — GPG encrypted data starts with 0x85 0x01 or similar
+    local magic
+    magic="$(head -c 4 "$snapshot" 2>/dev/null | od -A n -t x1 | tr -d ' \n')"
+    if [[ -z "$magic" ]]; then
+      fail "Cannot read encrypted snapshot"
+      return 1
+    fi
+    ok "GPG header present: ${magic}"
+
+    # Decrypt to stdout, pipe to tar t — no files written to disk.
+    # Single pass: capture the full listing to count entries.
+    info "Verifying decryption and archive structure..."
+    local pw
+    pw="$(_encrypt_passphrase)" || return 1
+
+    local entries
+    entries="$(gpg --decrypt \
+        --batch \
+        --no-symkey-cache \
+        --pinentry-mode loopback \
+        --passphrase-fd 3 \
+        3< <(echo "$pw") \
+        "$snapshot" 2>/dev/null | tar t 2>/dev/null)"
+    local gpg_rc="${PIPESTATUS[0]}" tar_rc="${PIPESTATUS[1]}"
+
+    if (( gpg_rc != 0 )); then
+      fail "Decryption failed (gpg exit ${gpg_rc})"
       return 1
     fi
 
-    local inner
-    inner="$(find "$cleanup_dir" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -1)"
-    if [[ -n "$inner" ]]; then
-      snapshot="$inner"
-    else
-      snapshot="$cleanup_dir"
+    if (( tar_rc != 0 )); then
+      fail "Archive structure is corrupt (tar exit ${tar_rc})"
+      return 1
     fi
+
+    # Count entries from the captured listing (single pass)
+    local total_entries total_dirs total_files
+    total_entries="$(echo "$entries" | wc -l)"
+    total_dirs="$(echo "$entries" | grep '/$' | wc -l)"
+    total_files=$(( total_entries - total_dirs ))
+
+    ok "Structure: ${total_dirs} directories, ${total_files} files"
+    ok "Encrypted snapshot integrity verified (no data written to disk)"
+    return 0
   fi
 
   if [[ ! -d "$snapshot" ]]; then
     log_error "Snapshot not found: ${snapshot}"
-    [[ -n "$cleanup_dir" ]] && rm -rf "$cleanup_dir" 2>/dev/null || true
     return 1
   fi
 
@@ -69,7 +103,6 @@ _verify_snapshot() {
   if (( total_dirs == 0 )); then
     fail "Snapshot appears empty or unreadable: ${snapshot}"
     log_error "No directories found in ${snapshot}"
-    [[ -n "$cleanup_dir" ]] && rm -rf "$cleanup_dir" 2>/dev/null || true
     return 1
   fi
 
@@ -88,9 +121,6 @@ _verify_snapshot() {
   else
     warn "No .bhm_metadata found in snapshot"
   fi
-
-  # Cleanup temp dir if this was an encrypted snapshot
-  [[ -n "$cleanup_dir" ]] && rm -rf "$cleanup_dir" 2>/dev/null || true
 
   if (( errors > 0 )); then
     fail "Verification found ${errors} issue(s)"

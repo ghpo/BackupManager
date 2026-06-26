@@ -70,8 +70,14 @@ _encrypt_snapshot_step() {
     ok "Snapshot encrypted: $(basename "$out_file")"
     log_info "Encrypted snapshot saved: ${out_file}"
   else
-    warn "Encryption failed — unencrypted snapshot remains at: ${snapshot_dir}"
+    warn "Encryption failed — see errors above"
     log_error "Snapshot encryption failed for: ${snapshot_dir}"
+    if [[ -d "$snapshot_dir" ]]; then
+      local remaining
+      remaining="$(find "$snapshot_dir" -type f 2>/dev/null | wc -l)"
+      warn "Files may have been partially removed by tar --remove-files (${remaining} files remain)"
+      log_warn "Remaining files in snapshot: ${remaining}"
+    fi
   fi
   return 0
 }

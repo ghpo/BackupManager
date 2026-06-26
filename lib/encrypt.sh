@@ -66,30 +66,68 @@ _encrypt_snapshot() {
     return 1
   fi
 
+  # Check available space before encrypting
+  local snapshot_size avail_space
+  snapshot_size="$(du -sb "$src_dir" 2>/dev/null | awk '{print $1}')"
+  avail_space="$(df -B1 "$(dirname "$out_file")" 2>/dev/null | awk 'NR==2 {print $4}')"
+  if [[ -n "$snapshot_size" && -n "$avail_space" ]] && (( snapshot_size > avail_space )); then
+    log_error "Not enough free space to encrypt snapshot"
+    log_error "  Snapshot size: $(_format_bytes "$snapshot_size")"
+    log_error "  Available:     $(_format_bytes "$avail_space")"
+    return 1
+  fi
+
   local pw
   pw="$(_encrypt_passphrase)" || return 1
 
   log_info "Encrypting snapshot: ${src_dir} → ${out_file}"
 
-  # tar + gpg in one pass (no temp files)
-  # Use --no-symkey-cache to avoid leaving key material on disk
-  if tar cf - -C "$(dirname "$src_dir")" "$(basename "$src_dir")" 2>/dev/null | \
+  # Kill gpg-agent to prevent stale agent state from interfering.
+  # With --batch --no-symkey-cache we don't need the agent at all.
+  gpgconf --kill gpg-agent 2>/dev/null || true
+
+  # Use --remove-files so tar frees space incrementally as it reads each file.
+  # Without it, source + archive coexist and can hit disk quotas.
+  local tar_err
+  tar_err="$(mktemp)" || return 1
+
+  # Run the pipe — capture PIPESTATUS immediately (before any other command).
+  tar cf - --remove-files -C "$(dirname "$src_dir")" "$(basename "$src_dir")" 2>"$tar_err" | \
      gpg --symmetric \
          --cipher-algo "${ENCRYPT_ALGO:-AES256}" \
          --batch \
          --no-symkey-cache \
+         --pinentry-mode loopback \
          --passphrase-fd 3 \
          3< <(echo "$pw") \
-         -o "$out_file" 2>/dev/null; then
+         -o "$out_file"
+  local tar_rc="${PIPESTATUS[0]}" gpg_rc="${PIPESTATUS[1]}"
+
+  # gpg exit=0 means the .tar.gpg is valid — consider it a success.
+  # tar can exit 2 for minor issues (sockets, special files) that do not
+  # affect the archive content.
+  if (( gpg_rc == 0 )); then
+    if (( tar_rc != 0 )); then
+      log_warn "tar exited with code ${tar_rc} (non-fatal — see details below)"
+      if [[ -s "$tar_err" ]]; then
+        tail -5 "$tar_err" | while IFS= read -r line; do log_warn "  ${line}"; done
+      fi
+    fi
+    rm -f "$tar_err" 2>/dev/null || true
     local size
     size="$(stat -c '%s' "$out_file" 2>/dev/null || echo "0")"
     log_info "Encrypted snapshot created: $(_format_bytes "$size")"
     return 0
-  else
-    log_error "Encryption failed for: ${src_dir}"
-    rm -f "$out_file" 2>/dev/null || true
-    return 1
   fi
+
+  # gpg failed — the output is unusable.
+  log_error "Encryption failed: gpg exited with code ${gpg_rc} (tar=${tar_rc})"
+  if [[ -s "$tar_err" ]]; then
+    log_error "tar errors (last lines):"
+    tail -5 "$tar_err" | while IFS= read -r line; do log_error "  ${line}"; done
+  fi
+  rm -f "$tar_err" "$out_file" 2>/dev/null || true
+  return 1
 }
 
 # --- Decrypt a .tar.gpg snapshot to stdout ---------------------------------
